@@ -1,0 +1,33 @@
+# Reference list of dependencies. Prefer running ./setup.sh, which installs
+# these in the correct order and verifies the GPU path — the onnxruntime
+# CPU/GPU split below needs careful ordering (see setup.sh).
+#
+# Tested working set (Python 3.12, Ubuntu 24.04 / WSL2, RTX 4090):
+#   numpy 2.4.6, insightface 1.0.1, onnxruntime-gpu 1.26.0,
+#   CUDA 12.9 + cuDNN 9.23 runtime wheels.
+
+# Face detection + recognition (RetinaFace + ArcFace, model 'buffalo_l').
+# Pulls numpy, onnx, scipy, scikit-image, opencv, and a CPU onnxruntime.
+insightface
+
+# Image I/O (headless = no GUI deps, correct for a server/WSL box) + progress.
+opencv-python-headless
+tqdm
+
+# HEIC/HEIF (iPhone) support. Optional; remove if you have no .heic files.
+pillow
+pillow-heif
+
+# GPU inference. IMPORTANT: do NOT also keep the plain 'onnxruntime' (CPU)
+# package — both install into the same directory and conflict. setup.sh
+# removes the CPU build and reinstalls this one with --no-deps.
+onnxruntime-gpu
+
+# CUDA 12 / cuDNN 9 runtime libraries (loaded via onnxruntime.preload_dlls()).
+# Required on a clean WSL2 box where only the GPU *driver* is present.
+nvidia-cublas-cu12
+nvidia-cudnn-cu12
+nvidia-cufft-cu12
+nvidia-curand-cu12
+nvidia-cuda-runtime-cu12
+nvidia-cuda-nvrtc-cu12

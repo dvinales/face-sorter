@@ -1,0 +1,24 @@
+# --- Privacy: never commit personal data (this repo is public) ---
+# Reference photos, photos to sort, and sorted output all contain images of
+# real people. gallery.npz holds face embeddings (biometric data).
+known/
+to_sort/
+results/
+*.npz
+report.csv
+
+# --- Python environment / caches ---
+.venv/
+__pycache__/
+*.py[cod]
+*.egg-info/
+.pytest_cache/
+
+# --- Logs / scratch ---
+*.log
+
+# --- OS / editor cruft ---
+.DS_Store
+Thumbs.db
+.idea/
+.vscode/
