@@ -1,4 +1,4 @@
-# face_sorter
+# face-sorter
 
 [![Repo](https://img.shields.io/badge/GitHub-dvinales%2Fface--sorter-181717?logo=github)](https://github.com/dvinales/face-sorter)
 
@@ -8,7 +8,7 @@ Sort a folder of photos by **who appears in them**, using GPU face recognition
 ## 1. Install (one time)
 
 ```bash
-cd ~/face_sorter
+cd ~/face-sorter
 bash setup.sh
 ```
 
