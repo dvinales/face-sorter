@@ -79,8 +79,10 @@ the resolved `--output` dir (so a nested output isn't re-ingested), and
 destinations then deletes the source exactly once.
 
 **Gallery cache.** Reference embeddings are cached to `<output>/gallery.npz`,
-keyed by a signature of reference file paths/sizes/mtimes + model name +
-det_sizes. Change any of those (or pass `--rebuild-gallery`) to force a rebuild.
+keyed by a signature of reference file paths/sizes/mtimes (nanosecond) + model
+name + det_sizes + `min_det_score` (the last matters because it filters which
+reference faces are embedded). Change any of those (or pass `--rebuild-gallery`)
+to force a rebuild.
 
 **Image loading** (`load_bgr`) normalises everything to BGR for insightface:
 `np.fromfile` + `cv2.imdecode` (handles non-ASCII paths), HEIC via `pillow-heif`

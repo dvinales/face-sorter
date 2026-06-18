@@ -18,6 +18,13 @@ def _unit(*vals):
     return v / np.linalg.norm(v)
 
 
+def _ang(deg):
+    """A 2-D unit vector at `deg` degrees — dot product of two equals cos(Δdeg)."""
+    import math
+    r = math.radians(deg)
+    return np.array([math.cos(r), math.sin(r)], dtype=np.float32)
+
+
 # Three clearly-separated "people" in 4-D space, plus a stranger.
 ANA = _unit(1, 0, 0, 0)
 JUAN = _unit(0, 1, 0, 0)
@@ -147,6 +154,59 @@ def test_resolve_destination_idempotent():
     twin.write_bytes(b"BBBBBB")
     p3, already3 = fs.resolve_destination(dst_dir, twin)
     assert p3.name == "photo__1.jpg" and already3 is False
+
+
+def test_image_matches_ignores_nan_face():
+    g = make_gallery()
+    nan_face = np.array([np.nan, np.nan, np.nan, np.nan], dtype=np.float32)
+    # A NaN embedding alone must not crash and must not spuriously match.
+    assert fs.image_matches([nan_face], g, threshold=0.5) == {}
+    # A NaN face beside a real Ana face must NOT suppress the real match
+    # (NaN >= threshold is False, so a naive sims.max() would lose Ana).
+    assert set(fs.image_matches([nan_face, ANA], g, threshold=0.5)) == {"Ana"}
+
+
+def test_calibration_separable_highsim_not_clamped():
+    # Two people, mutually high-similarity but cleanly separable:
+    # within-min = cos(10deg) ~= 0.985, cross-max = cos(20deg) ~= 0.940.
+    # The removed THRESHOLD_CLAMP would have forced suggested down to 0.75,
+    # below cross_max, admitting cross-person false matches.
+    g = {"A": np.stack([_ang(0), _ang(10)]),
+         "B": np.stack([_ang(30), _ang(40)])}
+    cal = fs.calibrate(g)
+    assert cal["separable"] is True
+    assert cal["suggested"] > 0.75
+    assert cal["cross_max"] < cal["suggested"] < cal["within_min"]
+
+
+def test_resolve_destination_handles_numbering_gap():
+    import tempfile
+    from pathlib import Path
+    src_dir = Path(tempfile.mkdtemp())
+    dst = Path(tempfile.mkdtemp())
+    src = src_dir / "photo.jpg"
+    src.write_bytes(b"SAME-CONTENT")
+    # base exists but differs; __1 is missing (the gap); __2 is byte-identical.
+    (dst / "photo.jpg").write_bytes(b"DIFFERENT")
+    (dst / "photo__2.jpg").write_bytes(b"SAME-CONTENT")
+    path, already = fs.resolve_destination(dst, src)
+    # Must find the identical __2 across the gap, not re-copy as a new file.
+    assert already is True
+    assert path.name == "photo__2.jpg"
+
+
+def test_gallery_signature_depends_on_min_det_score():
+    import tempfile
+    from pathlib import Path
+    known = Path(tempfile.mkdtemp())
+    (known / "Ana").mkdir()
+    (known / "Ana" / "a.jpg").write_bytes(b"fake-image-bytes")
+    s_lo = fs._gallery_signature(known, [(640, 640)], 0.5)
+    s_hi = fs._gallery_signature(known, [(640, 640)], 0.9)
+    # min_det_score changes which reference faces survive, so it must change the key.
+    assert s_lo != s_hi
+    # Same inputs -> same signature (deterministic).
+    assert s_lo == fs._gallery_signature(known, [(640, 640)], 0.5)
 
 
 def _run_all():

@@ -64,7 +64,6 @@ warnings.filterwarnings("ignore", category=FutureWarning, module=r"insightface.*
 IMAGE_EXTS = {".jpg", ".jpeg", ".png", ".webp", ".bmp", ".tif", ".tiff"}
 HEIC_EXTS = {".heic", ".heif"}
 DEFAULT_THRESHOLD = 0.50           # precision-leaning fallback for w600k_r50
-THRESHOLD_CLAMP = (0.20, 0.75)     # sane bounds for any auto-suggested threshold
 MODEL_NAME = "buffalo_l"
 UNKNOWN_DIR = "unknown"
 NO_FACE_DIR = "_no_face"
@@ -100,6 +99,11 @@ def image_matches(face_embs: list[np.ndarray],
     if not face_embs:
         return {}
     faces = np.asarray(np.stack(face_embs), dtype=np.float32)   # (n, d)
+    # Drop degenerate embeddings (NaN/inf): a single NaN row makes sims.max()
+    # NaN, and `NaN >= threshold` is False, so a real match would be silently lost.
+    faces = faces[np.isfinite(faces).all(axis=1)]
+    if faces.shape[0] == 0:
+        return {}
     matched: dict[str, float] = {}
     for person, refs in gallery.items():
         refs = np.asarray(refs, dtype=np.float32)
@@ -173,7 +177,10 @@ def calibrate(gallery: dict[str, np.ndarray]) -> dict:
                          f"within-person spread; using default {DEFAULT_THRESHOLD:.2f}. "
                          "Add 2-3 varied photos per person for a calibrated threshold.")
 
-    suggested = float(min(max(suggested, THRESHOLD_CLAMP[0]), THRESHOLD_CLAMP[1]))
+    # No clamp: the separable midpoint is always in (cross_max, within_min) and
+    # the fallback is DEFAULT_THRESHOLD — clamping could only push the separable
+    # threshold below cross_max and silently admit cross-person false matches.
+    suggested = float(suggested)
     return {
         "cross_max": cross_max,
         "within_min": within_min,
@@ -209,6 +216,7 @@ def resolve_destination(dest_dir: Path, src: Path):
     filename still gets a fresh __N name.
     """
     import filecmp
+    import re
 
     base = dest_dir / src.name
     if not base.exists():
@@ -218,12 +226,13 @@ def resolve_destination(dest_dir: Path, src: Path):
     except OSError:
         return unique_destination(dest_dir, src.name), False
 
+    # Gather ALL existing family members (base + stem__<n>suffix), not a
+    # contiguous walk: a gap in the numbering (e.g. __1 deleted, __2 kept) must
+    # not stop us short and hide a later byte-identical copy.
     stem, suffix = base.stem, base.suffix
-    family = [base]
-    i = 1
-    while (dest_dir / f"{stem}__{i}{suffix}").exists():
-        family.append(dest_dir / f"{stem}__{i}{suffix}")
-        i += 1
+    fam_re = re.compile(rf"^{re.escape(stem)}__\d+{re.escape(suffix)}$")
+    family = [base] + sorted(p for p in dest_dir.iterdir()
+                             if p.is_file() and fam_re.match(p.name))
     for cand in family:
         try:
             if cand.stat().st_size == src_size and \
@@ -231,7 +240,7 @@ def resolve_destination(dest_dir: Path, src: Path):
                 return cand, True            # identical copy already here
         except OSError:
             continue
-    return dest_dir / f"{stem}__{i}{suffix}", False
+    return unique_destination(dest_dir, src.name), False
 
 
 # ===========================================================================
@@ -349,14 +358,19 @@ def iter_images(root: Path, recursive: bool):
             yield p
 
 
-def _gallery_signature(known_dir: Path, det_sizes: list) -> str:
-    """Hash of all reference files (path/size/mtime) + model + det sizes."""
+def _gallery_signature(known_dir: Path, det_sizes: list, min_det_score: float) -> str:
+    """
+    Hash of everything that determines gallery contents: model, det sizes,
+    min_det_score (it is both the detector det_thresh and the reference-face
+    filter, so it changes which embeddings are produced), and each reference
+    file's path/size/mtime (nanosecond, so same-second in-place edits register).
+    """
     h = hashlib.sha256()
-    h.update(f"{MODEL_NAME}|{det_sizes}".encode())
+    h.update(f"{MODEL_NAME}|{det_sizes}|{min_det_score}".encode())
     for person_dir in sorted(p for p in known_dir.iterdir() if p.is_dir()):
         for img in iter_images(person_dir, recursive=True):
             st = img.stat()
-            h.update(f"{img.relative_to(known_dir)}|{st.st_size}|{int(st.st_mtime)}".encode())
+            h.update(f"{img.relative_to(known_dir)}|{st.st_size}|{st.st_mtime_ns}".encode())
     return h.hexdigest()
 
 
@@ -410,7 +424,12 @@ def build_gallery(app, known_dir: Path, min_det_score: float) -> dict[str, np.nd
                 continue
             if len(faces) > 1:
                 n_multi += 1
-            embs.append(largest_face(faces).normed_embedding.astype(np.float32))
+            emb = largest_face(faces).normed_embedding.astype(np.float32)
+            if not np.all(np.isfinite(emb)):
+                print(f"  [{person}] skipping non-finite embedding from "
+                      f"{img_path.name}", file=sys.stderr)
+                continue
+            embs.append(emb)
         if not embs:
             print(f"  WARNING: no usable face in any reference for '{person}' "
                   f"— this person will never be matched.", file=sys.stderr)
@@ -456,58 +475,75 @@ def classify(app, gallery, input_dir, output_dir, threshold, action,
              min_det_score, recursive, dry_run):
     from tqdm import tqdm  # lazy
 
+    import csv
+
     output_dir.mkdir(parents=True, exist_ok=True)
     # If --output is nested inside --input, never re-ingest already-sorted
     # images (recursive scan is the default, so a re-run would otherwise pick
-    # up results/PersonA/*.jpg and re-copy them as __1.jpg, __2.jpg, ...).
+    # up results/PersonA/*.jpg and re-copy them). Only pay the per-image
+    # resolve() syscall in that case — it can't matter when output is elsewhere.
     out_resolved = output_dir.resolve()
-    images = [p for p in iter_images(input_dir, recursive)
-              if not p.resolve().is_relative_to(out_resolved)]
+    if out_resolved.is_relative_to(input_dir.resolve()):
+        images = [p for p in iter_images(input_dir, recursive)
+                  if not p.resolve().is_relative_to(out_resolved)]
+    else:
+        images = list(iter_images(input_dir, recursive))
     if not images:
         print(f"No images found in {input_dir}", file=sys.stderr)
         return
     report_rows = [("image", "n_faces", "matched_persons", "best_score",
                     "status", "destinations")]
-    stats = {"matched": 0, "unknown": 0, "no_face": 0, "failed": 0}
+    stats = {"matched": 0, "unknown": 0, "no_face": 0, "failed": 0, "error": 0}
 
-    for img_path in tqdm(images, desc="Classifying", unit="img"):
-        img = load_bgr(img_path)
-        if img is None:
-            dests = place_image(img_path, [output_dir / FAILED_DIR], action, dry_run)
-            stats["failed"] += 1
-            report_rows.append((str(img_path), 0, "", "", "failed",
-                                ";".join(str(d) for d in dests)))
-            continue
+    def write_report():
+        with open(output_dir / REPORT_CSV, "w", newline="", encoding="utf-8") as fh:
+            csv.writer(fh).writerows(report_rows)
 
-        faces = [f for f in app.get(img) if f.det_score >= min_det_score]
-        if not faces:
-            dests = place_image(img_path, [output_dir / NO_FACE_DIR], action, dry_run)
-            stats["no_face"] += 1
-            report_rows.append((str(img_path), 0, "", "", "no_face",
-                                ";".join(str(d) for d in dests)))
-            continue
+    try:
+        for img_path in tqdm(images, desc="Classifying", unit="img"):
+            try:
+                img = load_bgr(img_path)
+                if img is None:
+                    dests = place_image(img_path, [output_dir / FAILED_DIR], action, dry_run)
+                    stats["failed"] += 1
+                    report_rows.append((str(img_path), 0, "", "", "failed",
+                                        ";".join(str(d) for d in dests)))
+                    continue
 
-        embs = [f.normed_embedding.astype(np.float32) for f in faces]
-        matched = image_matches(embs, gallery, threshold)
+                faces = [f for f in app.get(img) if f.det_score >= min_det_score]
+                if not faces:
+                    dests = place_image(img_path, [output_dir / NO_FACE_DIR], action, dry_run)
+                    stats["no_face"] += 1
+                    report_rows.append((str(img_path), 0, "", "", "no_face",
+                                        ";".join(str(d) for d in dests)))
+                    continue
 
-        if matched:
-            persons = sorted(matched, key=lambda p: matched[p], reverse=True)
-            dests = place_image(img_path, [output_dir / p for p in persons], action, dry_run)
-            stats["matched"] += 1
-            best = max(matched.values())
-            report_rows.append((str(img_path), len(faces),
-                                "|".join(persons), f"{best:.3f}", "matched",
-                                ";".join(str(d) for d in dests)))
-        else:
-            dests = place_image(img_path, [output_dir / UNKNOWN_DIR], action, dry_run)
-            stats["unknown"] += 1
-            report_rows.append((str(img_path), len(faces), "", "", "unknown",
-                                ";".join(str(d) for d in dests)))
+                embs = [f.normed_embedding.astype(np.float32) for f in faces]
+                matched = image_matches(embs, gallery, threshold)
 
-    # Write report
-    import csv
-    with open(output_dir / REPORT_CSV, "w", newline="", encoding="utf-8") as fh:
-        csv.writer(fh).writerows(report_rows)
+                if matched:
+                    persons = sorted(matched, key=lambda p: matched[p], reverse=True)
+                    dests = place_image(img_path, [output_dir / p for p in persons], action, dry_run)
+                    stats["matched"] += 1
+                    best = max(matched.values())
+                    report_rows.append((str(img_path), len(faces),
+                                        "|".join(persons), f"{best:.3f}", "matched",
+                                        ";".join(str(d) for d in dests)))
+                else:
+                    dests = place_image(img_path, [output_dir / UNKNOWN_DIR], action, dry_run)
+                    stats["unknown"] += 1
+                    report_rows.append((str(img_path), len(faces), "", "", "unknown",
+                                        ";".join(str(d) for d in dests)))
+            except Exception as exc:
+                # One bad image (decoder/engine crash, ENOSPC on copy, ...) must
+                # not abort the whole batch and lose the manifest. Record + go on.
+                stats["error"] += 1
+                report_rows.append((str(img_path), 0, "", "", "error", str(exc)[:300]))
+                print(f"  (error processing {img_path}: {exc})", file=sys.stderr)
+    finally:
+        # Always write the manifest, even on an unexpected/fatal error, so a
+        # --action move run never leaves files relocated with no record of where.
+        write_report()
 
     print("\n=== Summary ===")
     print(f"  Total images   : {len(images)}")
@@ -515,6 +551,7 @@ def classify(app, gallery, input_dir, output_dir, threshold, action,
     print(f"  Unknown (faces, no match): {stats['unknown']}")
     print(f"  No face detected: {stats['no_face']}")
     print(f"  Failed to load  : {stats['failed']}")
+    print(f"  Errors (processing): {stats['error']}")
     print(f"  Report          : {output_dir / REPORT_CSV}")
     if dry_run:
         print("  (DRY RUN — no files were copied or moved.)")
@@ -556,6 +593,8 @@ def main(argv=None):
             raise SystemExit(f"{label} is not a directory: {d}")
     if args.output.resolve() == args.input.resolve():
         raise SystemExit("--output must not be the same folder as --input.")
+    if args.threshold is not None and not (-1.0 <= args.threshold <= 1.0):
+        raise SystemExit("--threshold is a cosine similarity and must be in [-1.0, 1.0].")
     args.output.mkdir(parents=True, exist_ok=True)
     recursive = not args.no_recursive
 
@@ -565,13 +604,15 @@ def main(argv=None):
             raise ValueError
     except ValueError:
         raise SystemExit(f"--det-size must be comma-separated integers, got: {args.det_size!r}")
+    if any(w <= 0 for w, _ in det_sizes):
+        raise SystemExit(f"--det-size values must be positive integers, got: {args.det_size!r}")
 
     print(f"Initialising InsightFace '{MODEL_NAME}' (det_size={det_sizes}) ...")
     app, _ = build_app(use_gpu=not args.cpu, det_sizes=det_sizes,
                        det_thresh=args.min_det_score)
 
     # --- Gallery (cached) ---
-    signature = _gallery_signature(args.known, det_sizes)
+    signature = _gallery_signature(args.known, det_sizes, args.min_det_score)
     gallery = None if args.rebuild_gallery else load_gallery_cache(args.output, signature)
     if gallery is not None:
         print(f"Loaded cached gallery for {len(gallery)} person(s).")
@@ -579,6 +620,15 @@ def main(argv=None):
         print("Building gallery from reference folders ...")
         gallery = build_gallery(app, args.known, args.min_det_score)
         save_gallery_cache(args.output, signature, gallery)
+
+    # A person folder named like a reserved output bucket would silently merge
+    # its matches into that bucket on disk. Refuse rather than mislead.
+    reserved = {UNKNOWN_DIR.lower(), NO_FACE_DIR.lower(), FAILED_DIR.lower()}
+    clashes = sorted(p for p in gallery if p.lower() in reserved)
+    if clashes:
+        raise SystemExit(
+            f"Reference folder name(s) {clashes} collide with reserved output "
+            f"buckets ({sorted(reserved)}). Please rename those --known subfolders.")
 
     # --- Calibration ---
     cal = calibrate(gallery)
