@@ -1,0 +1,38 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  logic-tests:
+    name: Logic tests (py${{ matrix.python-version }})
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        python-version: ["3.11", "3.12", "3.13"]
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python-version }}
+
+      # test_logic.py exercises the pure matching / calibration / routing logic.
+      # face_sorter imports cv2 / insightface / onnxruntime LAZILY (inside the
+      # functions that need them), so the suite runs with numpy alone — no GPU,
+      # no model download, no heavy install. That is the whole point of the
+      # lazy-import design (see CLAUDE.md).
+      - name: Install numpy
+        run: |
+          python -m pip install --upgrade pip
+          pip install numpy
+
+      - name: Import smoke check
+        run: python -c "import face_sorter; print('face_sorter imports with numpy only')"
+
+      - name: Run logic test suite
+        run: python test_logic.py
