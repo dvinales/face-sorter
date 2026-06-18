@@ -1,5 +1,7 @@
 # face_sorter
 
+[![Repo](https://img.shields.io/badge/GitHub-dvinales%2Fface--sorter-181717?logo=github)](https://github.com/dvinales/face-sorter)
+
 Sort a folder of photos by **who appears in them**, using GPU face recognition
 (InsightFace `buffalo_l` — RetinaFace detector + ArcFace embeddings).
 
